@@ -8,9 +8,11 @@ ENV TEMP_DIR=/app/temp
 
 # 2. 安装 ImageMagick 和 AVIF/HEIC 依赖
 #    libheif-examples 提供了 magick 所需的 heif-enc 编码器
+#    exiftool 用于提取和处理图像的 EXIF 数据
 RUN apt-get update && apt-get install -y \
     imagemagick \
     libheif-examples \
+    exiftool \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. 设置工作目录 (结构同您的 OCR-HFS)

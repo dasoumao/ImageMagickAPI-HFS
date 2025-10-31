@@ -352,6 +352,25 @@ async def convert_image_dynamic(
 
         # 9. 成功：准备并返回文件响应
         logger.info(f"转换成功。输出文件: '{output_path}'")
+
+        # 10. 保留exif数据 exiftool -tagsfromfile oldfile -all:all -overwrite_original newfile
+        cmd = ['exiftool', '-tagsfromfile', input_path, '-all:all', '-overwrite_original', output_path]
+        process = await asyncio.subprocess.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=TIMEOUT_SECONDS
+        )
+
+        if process.returncode != 0:
+            error_message = f"Exiftool failed: {stderr.decode()[:1000]}"
+            logger.error(error_message)
+            raise HTTPException(status_code=500, detail=error_message)
+
+        logger.info(f"Exiftool success: {stdout.decode()[:1000]}")
         
         original_filename_base = os.path.splitext(file.filename)[0]
         download_filename = f"{original_filename_base}.{target_format}"
