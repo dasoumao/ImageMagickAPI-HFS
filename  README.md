@@ -5,7 +5,6 @@ colorFrom: purple
 colorTo: blue
 sdk: docker
 app_port: 8000
-pinned: false
 ---
 
 # 🧙‍♂️ Magick 图像转换 API
