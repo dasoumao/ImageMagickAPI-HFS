@@ -1,54 +1,131 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+ImageMagick 动态图像转换 API
+
+本项目基于 FastAPI 和 ImageMagick，提供一个高性能的 RESTful API 服务。
+它允许通过动态 URL 路径对上传的图像文件进行多种格式的（有损或无损）转换，
+并支持动画图像（如 GIF, APNG, Animated WebP/AVIF）的处理。
+
+主要端点:
+- POST /convert/{target_format}/{mode}/{setting}
+- GET /health
+"""
+
 import fastapi
-from fastapi import FastAPI, File, UploadFile, HTTPException, Response, BackgroundTasks
+from fastapi import (
+    FastAPI,
+    File,
+    UploadFile,
+    HTTPException,
+    BackgroundTasks,
+    Path
+)
 from fastapi.responses import FileResponse, JSONResponse
 import subprocess
-import asyncio # 使用 asyncio 来进行非阻塞的 subprocess 调用
+import asyncio
 import tempfile
 import os
 import shutil
 import logging
 import uuid
-from typing import Literal, Optional, List
+from typing import Literal
 
-# --- 配置  ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# --- 1. 应用配置 ---
+
+# 配置日志记录器
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-MAX_FILE_SIZE_MB = 200  # 最大文件大小
-TIMEOUT_SECONDS = 300   # 转换超时 (5分钟)
-TEMP_DIR = "/app/temp"  # 临时文件目录
-# ----------------
+# 资源限制
+MAX_FILE_SIZE_MB = 200  # 允许上传的最大文件大小 (MB)
+TIMEOUT_SECONDS = 300   # Magick 进程执行的超时时间 (秒)
+TEMP_DIR = os.getenv("TEMP_DIR", tempfile.gettempdir())  # 临时文件存储目录，优先使用环境变量，否则使用系统临时目录
 
-# 初始化 FastAPI 应用
+# --- 2. API 参数类型定义 ---
+
+# 定义 API 路径中允许的目标格式
+TargetFormat = Literal["avif", "webp", "jpeg", "png", "gif", "heif"]
+
+# 定义 API 路径中允许的转换模式
+ConversionMode = Literal["lossless", "lossy"]
+
+# --- 3. FastAPI 应用初始化 ---
+
 app = FastAPI(
-    title="Magick AVIF Converter",
-    description="API to convert images to lossless AVIF, preserving metadata.",
-    version="1.0.0"
+    title="Magick 动态图像转换器 (V3)",
+    description="通过动态 API 路径实现多种格式的(无)损图像转换，支持动图。",
+    version="3.0.0"
 )
 
-# 确保临时目录存在 
+# 启动时确保临时目录存在
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# --- 健康检查 (适配 Magick) ---
-@app.get("/health", summary="Health Check")
-async def health_check():
-    """提供详细的API和依赖健康状态检查"""
+# --- 4. 辅助函数 ---
+
+async def get_upload_file_size(upload_file: UploadFile) -> int:
+    """
+    异步获取上传文件的大小（以字节为单位）。
+    
+    通过 seek 到文件末尾来测量大小，然后重置指针。
+    (继承自 ocrmypdf-hfs 实践)
+
+    Args:
+        upload_file: FastAPI 的 UploadFile 对象。
+
+    Returns:
+        文件大小（字节）。
+    """
+    current_position = upload_file.file.tell()
+    upload_file.file.seek(0, 2)  # 移动到文件末尾
+    size = upload_file.file.tell()
+    upload_file.file.seek(current_position)  # 恢复原始指针位置
+    return size
+
+def cleanup_temp_dir(temp_dir: str):
+    """
+    在后台任务中安全地清理临时会话目录。
+    (继承自 ocrmypdf-hfs 实践)
+
+    Args:
+        temp_dir: 要递归删除的目录路径。
+    """
     try:
-        # 检查 Magick 是否可用
+        if os.path.exists(temp_dir):
+            logger.info(f"后台清理：正在删除临时目录: {temp_dir}")
+            shutil.rmtree(temp_dir)
+            logger.info(f"后台清理：已成功删除 {temp_dir}")
+    except Exception as cleanup_error:
+        logger.error(f"后台清理：删除 {temp_dir} 失败: {cleanup_error}", exc_info=True)
+
+# --- 5. API 端点 ---
+
+@app.get("/health", summary="服务健康检查")
+async def health_check():
+    """
+    提供详细的API和服务依赖（ImageMagick, heif-enc）的健康状态。
+    (继承自 imagemagickapi-hfs 实践)
+    """
+    try:
+        # 检查 ImageMagick
         proc_magick = await asyncio.subprocess.create_subprocess_exec(
             'magick', '--version', stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         stdout_m, stderr_m = await proc_magick.communicate()
         magick_version = stdout_m.decode().split('\n')[0] if proc_magick.returncode == 0 else "Not available"
         
-        # 检查 AVIF 编码器 (heif-enc) 是否可用
+        # 检查 AVIF/HEIF 编码器
         proc_heif = await asyncio.subprocess.create_subprocess_exec(
             'which', 'heif-enc', stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         stdout_h, stderr_h = await proc_heif.communicate()
-        heif_encoder_path = stdout_h.decode().strip() if proc_heif.returncode == 0 else "Not available (AVIF conversion will fail)"
+        heif_encoder_path = stdout_h.decode().strip() if proc_heif.returncode == 0 else "Not available (AVIF/HEIF conversion will fail)"
 
-        # 检查磁盘空间 
+        # 检查磁盘空间
         disk_info = os.statvfs(TEMP_DIR)
         free_space_mb = (disk_info.f_bavail * disk_info.f_frsize) / (1024 * 1024)
         
@@ -63,139 +140,250 @@ async def health_check():
             }
         }
     except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
-        return {"status": "unhealthy", "error": str(e)}
+        logger.error(f"健康检查失败: {str(e)}")
+        return JSONResponse(status_code=500, content={"status": "unhealthy", "error": str(e)})
 
-# --- 根路径 API 端点 (实现您的需求) ---
-@app.post("/",
-          summary="Convert Image to Lossless AVIF",
-          response_class=FileResponse,
-          responses={
-              200: {"content": {"image/avif": {}}, "description": "Successfully converted image to lossless AVIF."},
-              400: {"description": "Bad Request (e.g., file too large)"},
-              500: {"description": "Internal Server Error (Magick conversion failed)"},
-              504: {"description": "Gateway Timeout (Conversion took too long)"}
-          })
-async def convert_to_avif_lossless(
+@app.post(
+    "/convert/{target_format}/{mode}/{setting}",
+    summary="动态转换图像 (支持动图)",
+    response_class=FileResponse,
+    responses={
+        200: {"description": "转换成功，返回图像文件"},
+        400: {"description": "请求无效（例如文件过大）"},
+        422: {"description": "路径参数验证失败（例如格式不支持）"},
+        500: {"description": "服务器内部转换失败"},
+        504: {"description": "转换处理超时"}
+    }
+)
+async def convert_image_dynamic(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(..., description="The image file to be converted (PNG, JPEG, WebP, etc.).")
+    target_format: TargetFormat,
+    mode: ConversionMode,
+    setting: int = Path(..., ge=0, le=100, description="质量(有损) 或 压缩速度(无损) (0-100)"),
+    file: UploadFile = File(..., description="要转换的图像文件 (支持动图)")
 ):
     """
-    接收图像文件，将其无损转换为 AVIF，并保留元信息。
-    """
-    logger.info(f"Received request: filename={file.filename}")
+    通过动态 URL 路径接收图像文件，执行转换并返回结果。
 
-    # --- 文件大小检查  ---
-    file_size_mb = await get_upload_file_size(file) / (1024 * 1024)
-    if file_size_mb > MAX_FILE_SIZE_MB:
-        logger.warning(f"File too large: {file_size_mb:.2f}MB (max: {MAX_FILE_SIZE_MB}MB)")
+    - **target_format**: 目标格式 (avif, webp, jpeg, png, gif, heif)
+    - **mode**: 转换模式 (lossless, lossy)
+    - **setting**: 模式设置 (0-100)
+        - mode=lossy: 0=最差质量, 100=最佳质量
+        - mode=lossless: 0=最慢/最佳压缩, 100=最快/最差压缩
+    """
+    logger.info(f"收到动态转换请求: {target_format}/{mode}/{setting} (文件: {file.filename})")
+
+    # 预检查: AVIF/HEIF 格式需要 heif-enc 依赖
+    if target_format in ["avif", "heif"]:
+        try:
+            proc_check = await asyncio.subprocess.create_subprocess_exec(
+                'which', 'heif-enc',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc_check.communicate()
+            if proc_check.returncode != 0:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"AVIF/HEIF encoding is not available. heif-enc encoder not found."
+                )
+        except Exception as e:
+            logger.error(f"依赖检查失败: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail=f"Unable to verify AVIF/HEIF encoder availability."
+            )
+
+    # 1. 验证文件扩展名
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Filename is required.")
+
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    allowed_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif', '.heif', '.heic', '.bmp', '.tiff', '.tif'}
+    if file_ext not in allowed_extensions:
         raise HTTPException(
-            status_code=400, 
-            detail=f"File too large. Maximum allowed size is {MAX_FILE_SIZE_MB}MB. Your file is {file_size_mb:.2f}MB."
+            status_code=400,
+            detail=f"Unsupported file format: {file_ext}. Allowed formats: {', '.join(allowed_extensions)}"
         )
 
-    # --- 临时目录和路径  ---
+    # 2. 验证文件大小
+    file_size_mb = await get_upload_file_size(file) / (1024 * 1024)
+    if file_size_mb > MAX_FILE_SIZE_MB:
+        logger.warning(f"文件过大: {file_size_mb:.2f}MB (最大: {MAX_FILE_SIZE_MB}MB)")
+        raise HTTPException(
+            status_code=400, 
+            detail=f"File too large. Max size is {MAX_FILE_SIZE_MB}MB."
+        )
+
+    # 3. 创建唯一的临时工作目录
     session_id = str(uuid.uuid4())
     temp_dir = os.path.join(TEMP_DIR, session_id)
     os.makedirs(temp_dir, exist_ok=True)
-    
-    # 获取原始文件扩展名
+
     _, file_extension = os.path.splitext(file.filename)
     input_path = os.path.join(temp_dir, f"input{file_extension}")
-    output_path = os.path.join(temp_dir, f"output.avif")
+    output_path = os.path.join(temp_dir, f"output.{target_format}")
 
-    logger.info(f"Processing in temporary directory: {temp_dir}")
+    logger.info(f"正在临时目录中处理: {temp_dir}")
 
+    cleanup_scheduled = False
     try:
-        # --- 保存上传的文件  ---
-        logger.info(f"Saving uploaded file '{file.filename}' to '{input_path}'")
+        # 4. 保存上传的文件到临时输入路径
+        logger.info(f"正在保存上传的文件 '{file.filename}' 至 '{input_path}'")
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        logger.info("File saved successfully.")
+        logger.info("文件保存成功。")
 
-        # --- 构建 Magick 命令 (您的核心需求) ---
-        cmd = [
-            'magick',
-            input_path,
-            '-define', 'avif:lossless=true',  # 无损
-            '-define', 'avif:speed=0',        # 最佳压缩率
-            output_path                      # (无 -strip，保留元信息)
-        ]
-        
+        # 5. 动态构建 ImageMagick 命令行参数
+        cmd = ['magick', input_path]
+
+        # 关键: 仅对动画格式使用 -coalesce 以优化性能
+        # -coalesce 会合并所有帧，确保动图（GIF/WebP/AVIF）被正确处理
+        # 检测可能是动画的格式
+        animated_formats = ['.gif', '.webp', '.apng', '.png']
+        if file_extension.lower() in animated_formats or target_format in ['gif', 'webp']:
+            cmd.append('-coalesce')
+
+        # --- 5a. 无损 (lossless) 模式逻辑 ---
+        if mode == "lossless":
+            # 'setting' (0-100) 代表压缩速度 (0=最佳/最慢, 100=最快/最差)
+            
+            if target_format == "avif":
+                # AVIF speed (0-10), 0 是最慢/最佳
+                avif_speed = min(10, int(setting / 10.0))
+                cmd.extend(['-define', 'avif:lossless=true'])
+                cmd.extend(['-define', f'avif:speed={avif_speed}'])
+            
+            elif target_format == "heif":
+                # HEIF speed (0-10), 0 是最慢/最佳
+                heif_speed = min(10, int(setting / 10.0))
+                cmd.extend(['-define', 'heif:lossless=true'])
+                cmd.extend(['-define', f'heif:speed={heif_speed}'])
+
+            elif target_format == "webp":
+                # WebP method (0-6), 6 是最慢/最佳
+                # 映射: setting(0) -> method(6), setting(100) -> method(0)
+                # 使用线性插值确保精确映射
+                webp_method = round(6 - (setting / 100.0) * 6)
+                # WebP 无损模式下 quality 应始终为 100
+                cmd.extend(['-define', 'webp:lossless=true'])
+                cmd.extend(['-define', f'webp:method={webp_method}'])
+                cmd.extend(['-quality', '100'])
+
+            elif target_format == "jpeg":
+                # JPEG 几乎没有通用的无损模式，使用-quality 100作为最佳有损替代
+                cmd.extend(['-quality', '100'])
+                
+            elif target_format == "png":
+                # PNG 始终无损
+                # 映射: setting(0) -> compression(9), setting(100) -> compression(0)
+                png_compression = min(9, int((100 - setting) * 0.09))
+                # Magick -quality 映射: 91=级别0, 100=级别9
+                cmd.extend(['-quality', str(91 + png_compression)])
+            
+            elif target_format == "gif":
+                # GIF 始终是基于调色板的无损
+                # -layers optimize 用于优化动图帧
+                cmd.extend(['-layers', 'optimize'])
+                pass # Magick 默认值适用于无损GIF
+
+        # --- 5b. 有损 (lossy) 模式逻辑 ---
+        elif mode == "lossy":
+            # 'setting' (0-100) 代表 质量 (0=最差, 100=最佳)
+            quality = setting
+
+            if target_format == "avif":
+                # AVIF cq-level (0-63), 0 是最佳
+                # 映射: quality(100) -> cq(0) ; quality(0) -> cq(63)
+                cq_level = max(0, min(63, int(63 * (1 - quality / 100.0))))
+                cmd.extend(['-define', f'avif:cq-level={cq_level}'])
+                cmd.extend(['-define', 'avif:speed=4']) # 默认使用较快的速度
+            
+            elif target_format == "heif":
+                # HEIF (heif-enc) 使用 -quality (0-100) 进行有损压缩
+                cmd.extend(['-quality', str(quality)])
+
+            elif target_format == "webp":
+                cmd.extend(['-quality', str(quality)])
+                cmd.extend(['-define', 'webp:method=4']) # 默认使用较快的速度
+            
+            elif target_format == "jpeg":
+                cmd.extend(['-quality', str(quality)])
+                
+            elif target_format == "png":
+                # PNG 本身无损，通过量化（减少颜色）模拟 "有损"
+                # 映射: quality(100) -> 256色, quality(0) -> 2色
+                colors = max(2, int(256 * (quality / 100.0)))
+                cmd.extend(['-colors', str(colors), '+dither'])
+            
+            elif target_format == "gif":
+                # GIF "有损" 通过减少调色板颜色实现
+                colors = max(2, int(256 * (quality / 100.0)))
+                cmd.extend(['-colors', str(colors), '+dither'])
+                cmd.extend(['-layers', 'optimize'])
+
+
+        # 6. 添加输出路径并完成命令构建
+        cmd.append(output_path)
         command_str = ' '.join(cmd)
-        logger.info(f"Executing command: {command_str}")
+        logger.info(f"正在执行命令: {command_str}")
 
-        # --- 执行 Magick 命令 (异步) ---
-        process = await asyncio.wait_for(
-            asyncio.subprocess.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            ),
+        # 7. 异步执行 Magick 命令 (继承自 imagemagickapi-hfs 实践)
+        process = await asyncio.subprocess.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
             timeout=TIMEOUT_SECONDS
         )
-        stdout, stderr = await process.communicate()
 
-        # --- 检查命令执行结果 ---
+        # 8. 检查命令执行结果
         if process.returncode != 0:
-            error_message = f"Magick failed with exit code {process.returncode}."
-            logger.error(f"{error_message}\nStderr: {stderr.decode()[:1000]}")
-            raise HTTPException(status_code=500, detail=f"ImageMagick conversion failed. Error: {stderr.decode()}")
-        
-        if not os.path.exists(output_path):
-            error_message = "Magick command succeeded but output file was not found."
+            error_message = f"Magick failed: {stderr.decode()[:1000]}"
             logger.error(error_message)
             raise HTTPException(status_code=500, detail=error_message)
         
-        # --- 成功  ---
-        logger.info(f"Conversion successful. Output file: '{output_path}'")
+        if not os.path.exists(output_path):
+            error_message = "Magick 命令成功执行，但未找到输出文件。"
+            logger.error(error_message)
+            raise HTTPException(status_code=500, detail=error_message)
+
+        # 9. 成功：准备并返回文件响应
+        logger.info(f"转换成功。输出文件: '{output_path}'")
         
-        # 生成下载文件名
         original_filename_base = os.path.splitext(file.filename)[0]
-        download_filename = f"{original_filename_base}_lossless.avif"
+        download_filename = f"{original_filename_base}_{mode}_{setting}.{target_format}"
+        
+        # 动态设置 MimeType
+        media_type = f"image/{target_format}"
+        if target_format == "heif":
+            media_type = "image/heif" # HEIF 的 MimeType
 
-        # 注册后台清理 
+        # 注册后台清理任务
         background_tasks.add_task(cleanup_temp_dir, temp_dir)
+        cleanup_scheduled = True
 
-        # 返回文件 
         return FileResponse(
             path=output_path,
-            media_type='image/avif',
-            filename=download_filename,
-            background=background_tasks
+            media_type=media_type,
+            filename=download_filename
         )
 
     except asyncio.TimeoutError:
-        logger.error(f"Magick processing timed out after {TIMEOUT_SECONDS}s for file '{file.filename}'.")
+        logger.error(f"Magick 处理超时 (>{TIMEOUT_SECONDS}s): {file.filename}")
         raise HTTPException(status_code=504, detail=f"Conversion timed out after {TIMEOUT_SECONDS} seconds.")
     except HTTPException as http_exc:
+        # 重新抛出已知的 HTTP 异常
         raise http_exc
     except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An unexpected server error occurred.")
+        # 捕获所有其他意外错误
+        logger.error(f"发生意外错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An unexpected server error occurred: {str(e)}")
     finally:
-        # 确保关闭文件句柄
+        # 确保关闭上传的文件句柄
         await file.close()
-        # 如果没有成功注册后台任务，也尝试清理 (备用)
-        if not 'background_tasks' in locals() and os.path.exists(temp_dir):
-             cleanup_temp_dir(temp_dir)
-
-# --- 清理函数  ---
-def cleanup_temp_dir(temp_dir: str):
-    """清理临时目录及其内容的辅助函数"""
-    try:
-        if os.path.exists(temp_dir):
-            logger.info(f"Cleaning up temporary directory: {temp_dir}")
-            shutil.rmtree(temp_dir)
-            logger.info("Temporary directory cleaned up successfully.")
-    except Exception as cleanup_error:
-        logger.error(f"Error cleaning up temporary directory {temp_dir}: {cleanup_error}", exc_info=True)
-
-# --- 文件大小检查  ---
-async def get_upload_file_size(upload_file: UploadFile) -> int:
-    """获取上传文件的大小（以字节为单位）"""
-    current_position = upload_file.file.tell()
-    upload_file.file.seek(0, 2)  # 2 表示从文件末尾
-    size = upload_file.file.tell()
-    upload_file.file.seek(current_position)
-    return size
+        # 备用清理：仅当未注册后台任务时立即清理
+        if not cleanup_scheduled and os.path.exists(temp_dir):
+            cleanup_temp_dir(temp_dir)

@@ -4,6 +4,7 @@ FROM python:3.10-slim
 # 设置环境变量
 ENV PORT=8000
 ENV PYTHONUNBUFFERED=1
+ENV TEMP_DIR=/app/temp
 
 # 2. 安装 ImageMagick 和 AVIF/HEIC 依赖
 #    libheif-examples 提供了 magick 所需的 heif-enc 编码器
