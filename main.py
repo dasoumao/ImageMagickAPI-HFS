@@ -354,7 +354,7 @@ async def convert_image_dynamic(
         logger.info(f"转换成功。输出文件: '{output_path}'")
         
         original_filename_base = os.path.splitext(file.filename)[0]
-        download_filename = f"{original_filename_base}_{mode}_{setting}.{target_format}"
+        download_filename = f"{original_filename_base}.{target_format}"
         
         # 动态设置 MimeType
         media_type = f"image/{target_format}"

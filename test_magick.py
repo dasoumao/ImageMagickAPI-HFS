@@ -9,8 +9,8 @@ api_base_url = "https://blueskyxn-imagemagickapi-hfs.hf.space"
 
 # 转换参数: 格式/模式/设置
 target_format = "avif"  # avif, webp, jpeg, png, gif, heif
-mode = "lossy"          # lossy, lossless
-setting = 80            # 0-100 (有损模式为质量, 无损模式为压缩速度)
+mode = "lossless"          # lossy, lossless
+setting = 0            # 0-100 (有损模式为质量, 无损模式为压缩速度)
 
 # 构建完整的 API URL
 api_url = f"{api_base_url}/convert/{target_format}/{mode}/{setting}"
